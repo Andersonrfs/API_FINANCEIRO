@@ -7,6 +7,14 @@ app.get("/health", (req, res) => {
   res.status(200).json({ servico: "financas-familia", versao: "1.0.0" });
 });
 
+app.get("/status", (req, res) => {
+  res.status(200).json({
+    nome: "financas-familia",
+    versao: "1.0.0",
+    hora: new Date().toISOString(),
+  });
+});
+
 function converterValor(bruto) {
   if (typeof bruto === "number") return bruto;
   if (typeof bruto !== "string") return NaN;
@@ -27,15 +35,36 @@ function converterValor(bruto) {
   return NaN;
 }
 
-app.post("/lancamentos", (req, res) => {
-  const { valor, descricao } = req.body || {};
-  const numero = converterValor(valor);
+// Data no formato AAAA-MM-DD e que exista no calendario ("2026-02-30" nao)
+function dataValida(data) {
+  if (typeof data !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(data)) {
+    return false;
+  }
+  const convertida = new Date(data + "T00:00:00Z");
+  return !isNaN(convertida) && convertida.toISOString().slice(0, 10) === data;
+}
 
-  if (!Number.isFinite(numero) || numero <= 0) {
-    return res.status(400).json({ erro: "valor_invalido" });
+app.post("/lancamentos", (req, res) => {
+  const { valor, descricao, data } = req.body || {};
+  const numero = converterValor(valor);
+  const campos = [];
+
+  if (!Number.isFinite(numero) || numero <= 0) campos.push("valor");
+  if (typeof descricao !== "string" || descricao.trim() === "") {
+    campos.push("descricao");
+  }
+  if (!dataValida(data)) campos.push("data");
+
+  if (campos.length > 0) {
+    return res.status(400).json({ erro: "campos_invalidos", campos });
   }
 
-  res.status(201).json({ criado: true, valor: numero, descricao });
+  res.status(201).json({
+    criado: true,
+    valor: numero,
+    descricao: descricao.trim(),
+    data,
+  });
 });
 
 // JSON malformado no corpo: responde em JSON em vez da pagina HTML padrao
