@@ -2,7 +2,7 @@ const path = require("path");
 require("dotenv").config({ path: path.join(__dirname, ".env"), quiet: true });
 
 const express = require("express");
-const { createClient, isAuthApiError } = require("@supabase/supabase-js");
+const { createClient } = require("@supabase/supabase-js");
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
@@ -13,20 +13,20 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
   process.exit(1);
 }
 
-// Um cliente por requisicao, com o token de quem esta logado:
-// assim o RLS do banco garante que cada pessoa so grava em nome proprio.
-function clienteDoUsuario(token) {
-  return createClient(SUPABASE_URL, SUPABASE_KEY, {
-    global: { headers: { Authorization: `Bearer ${token}` } },
-    auth: { persistSession: false, autoRefreshToken: false },
-  });
+// Sem login, a API precisa da chave secreta (service_role), que ignora o RLS.
+// Com a chave publica, o banco recusa todo insert.
+if (SUPABASE_KEY.startsWith("sb_publishable_")) {
+  console.warn(
+    "Aviso: SUPABASE_KEY e a chave publica. Sem login, os inserts vao falhar. " +
+      "Use a chave secreta (service_role) no .env."
+  );
 }
 
-function lerToken(req) {
-  const cabecalho = req.get("Authorization") || "";
-  const [tipo, token] = cabecalho.split(" ");
-  return tipo === "Bearer" && token ? token : null;
-}
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
+  auth: { persistSession: false, autoRefreshToken: false },
+});
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const app = express();
 app.use(express.json());
@@ -77,19 +77,29 @@ function textoPreenchido(texto) {
 }
 
 app.post("/lancamentos", async (req, res) => {
-  const token = lerToken(req);
-  if (!token) {
-    return res.status(401).json({ erro: "nao_autenticado" });
-  }
-
   const corpo = req.body || {};
   const valor = converterValor(corpo.valor);
   const campos = [];
 
+  // Sem login, o dono do lancamento vem no corpo: o UUID da pessoa (auth.users).
+  // Tira espacos e caracteres invisiveis que costumam vir junto ao copiar e colar.
+  const usuarioId =
+    typeof corpo.usuario_id === "string"
+      ? corpo.usuario_id.replace(/[\u200B-\u200D\uFEFF]/g, "").trim().toLowerCase()
+      : "";
+  if (!UUID.test(usuarioId)) campos.push("usuario_id");
   if (!Number.isInteger(corpo.conta_id) || corpo.conta_id <= 0) {
     campos.push("conta_id");
   }
-  if (!textoPreenchido(corpo.categoria_codigo)) campos.push("categoria_codigo");
+  // A categoria pode vir pelo codigo (como o app usa) ou pelo id antigo.
+  // Se vierem os dois, vale o codigo.
+  const categoriaId =
+    typeof corpo.categoria_id === "string" && /^\d+$/.test(corpo.categoria_id.trim())
+      ? Number(corpo.categoria_id.trim())
+      : corpo.categoria_id;
+  const porCodigo = textoPreenchido(corpo.categoria_codigo);
+  const porId = !porCodigo && Number.isInteger(categoriaId) && categoriaId > 0;
+  if (!porCodigo && !porId) campos.push("categoria_codigo");
   if (corpo.tipo !== "entrada" && corpo.tipo !== "saida") campos.push("tipo");
   if (!Number.isFinite(valor) || valor <= 0) campos.push("valor");
   if (!dataValida(corpo.data_lancamento)) campos.push("data_lancamento");
@@ -100,34 +110,33 @@ app.post("/lancamentos", async (req, res) => {
   }
 
   try {
-    const supabase = clienteDoUsuario(token);
-
-    // O dono do lancamento sai do token, nunca do corpo da requisicao.
-    const { data: sessao, error: erroSessao } = await supabase.auth.getUser(token);
-    if (erroSessao || !sessao.user) {
-      if (!erroSessao || isAuthApiError(erroSessao)) {
-        return res.status(401).json({ erro: "nao_autenticado" });
-      }
-      return res.status(500).json({ erro: erroSessao.message });
-    }
-
-    // Mesmas verificacoes do app: a conta e a categoria precisam ser de quem
-    // esta logado, e o tipo do lancamento precisa ser o tipo da categoria.
-    const categoriaCodigo = corpo.categoria_codigo.trim();
+    // Mesmas verificacoes do app: a conta e a categoria precisam ser da pessoa
+    // do usuario_id, e o tipo do lancamento precisa ser o tipo da categoria.
+    // A chave service_role ignora o RLS, entao o filtro por user_id e obrigatorio.
+    const buscaCategoria = supabase
+      .from("categorias")
+      .select("codigo, tipo")
+      .eq("user_id", usuarioId);
     const [conta, categoria] = await Promise.all([
       supabase
         .from("contas")
         .select("id")
         .eq("id", corpo.conta_id)
-        .eq("user_id", sessao.user.id)
+        .eq("user_id", usuarioId)
         .maybeSingle(),
-      supabase
-        .from("categorias")
-        .select("tipo")
-        .eq("codigo", categoriaCodigo)
-        .eq("user_id", sessao.user.id)
-        .maybeSingle(),
+      porCodigo
+        ? buscaCategoria.eq("codigo", corpo.categoria_codigo.trim()).maybeSingle()
+        : buscaCategoria.eq("id", categoriaId).maybeSingle(),
     ]);
+
+    // 42703: a coluna categorias.id (obsoleta) foi apagada pelo script 04.
+    if (porId && categoria.error && categoria.error.code === "42703") {
+      return res.status(400).json({
+        erro: "campos_invalidos",
+        campos: ["categoria_codigo"],
+        dica: 'categoria_id nao existe mais no banco. Envie categoria_codigo (ex.: "01").',
+      });
+    }
 
     if (conta.error || categoria.error) {
       const erroConsulta = conta.error || categoria.error;
@@ -137,7 +146,7 @@ app.post("/lancamentos", async (req, res) => {
 
     const camposDoDono = [];
     if (!conta.data) camposDoDono.push("conta_id");
-    if (!categoria.data) camposDoDono.push("categoria_codigo");
+    if (!categoria.data) camposDoDono.push(porId ? "categoria_id" : "categoria_codigo");
     if (camposDoDono.length > 0) {
       return res
         .status(400)
@@ -154,9 +163,9 @@ app.post("/lancamentos", async (req, res) => {
     const { data: criado, error } = await supabase
       .from("lancamentos")
       .insert({
-        user_id: sessao.user.id,
+        user_id: usuarioId,
         conta_id: corpo.conta_id,
-        categoria_codigo: categoriaCodigo,
+        categoria_codigo: categoria.data.codigo,
         tipo: corpo.tipo,
         valor: Math.round(valor * 100) / 100,
         data: corpo.data_lancamento,
