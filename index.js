@@ -1,4 +1,32 @@
+const path = require("path");
+require("dotenv").config({ path: path.join(__dirname, ".env"), quiet: true });
+
 const express = require("express");
+const { createClient, isAuthApiError } = require("@supabase/supabase-js");
+
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_KEY;
+const PORT = process.env.PORT || 3000;
+
+if (!SUPABASE_URL || !SUPABASE_KEY) {
+  console.error("Defina SUPABASE_URL e SUPABASE_KEY no .env (veja .env.example).");
+  process.exit(1);
+}
+
+// Um cliente por requisicao, com o token de quem esta logado:
+// assim o RLS do banco garante que cada pessoa so grava em nome proprio.
+function clienteDoUsuario(token) {
+  return createClient(SUPABASE_URL, SUPABASE_KEY, {
+    global: { headers: { Authorization: `Bearer ${token}` } },
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
+}
+
+function lerToken(req) {
+  const cabecalho = req.get("Authorization") || "";
+  const [tipo, token] = cabecalho.split(" ");
+  return tipo === "Bearer" && token ? token : null;
+}
 
 const app = express();
 app.use(express.json());
@@ -44,27 +72,69 @@ function dataValida(data) {
   return !isNaN(convertida) && convertida.toISOString().slice(0, 10) === data;
 }
 
-app.post("/lancamentos", (req, res) => {
-  const { valor, descricao, data } = req.body || {};
-  const numero = converterValor(valor);
+function textoPreenchido(texto) {
+  return typeof texto === "string" && texto.trim() !== "";
+}
+
+app.post("/lancamentos", async (req, res) => {
+  const token = lerToken(req);
+  if (!token) {
+    return res.status(401).json({ erro: "nao_autenticado" });
+  }
+
+  const corpo = req.body || {};
+  const valor = converterValor(corpo.valor);
   const campos = [];
 
-  if (!Number.isFinite(numero) || numero <= 0) campos.push("valor");
-  if (typeof descricao !== "string" || descricao.trim() === "") {
-    campos.push("descricao");
+  if (!Number.isInteger(corpo.conta_id) || corpo.conta_id <= 0) {
+    campos.push("conta_id");
   }
-  if (!dataValida(data)) campos.push("data");
+  if (!textoPreenchido(corpo.categoria_codigo)) campos.push("categoria_codigo");
+  if (corpo.tipo !== "entrada" && corpo.tipo !== "saida") campos.push("tipo");
+  if (!Number.isFinite(valor) || valor <= 0) campos.push("valor");
+  if (!dataValida(corpo.data_lancamento)) campos.push("data_lancamento");
+  if (!textoPreenchido(corpo.descricao)) campos.push("descricao");
 
   if (campos.length > 0) {
     return res.status(400).json({ erro: "campos_invalidos", campos });
   }
 
-  res.status(201).json({
-    criado: true,
-    valor: numero,
-    descricao: descricao.trim(),
-    data,
-  });
+  try {
+    const supabase = clienteDoUsuario(token);
+
+    // O dono do lancamento sai do token, nunca do corpo da requisicao.
+    const { data: sessao, error: erroSessao } = await supabase.auth.getUser(token);
+    if (erroSessao || !sessao.user) {
+      if (!erroSessao || isAuthApiError(erroSessao)) {
+        return res.status(401).json({ erro: "nao_autenticado" });
+      }
+      return res.status(500).json({ erro: erroSessao.message });
+    }
+
+    const { data: criado, error } = await supabase
+      .from("lancamentos")
+      .insert({
+        user_id: sessao.user.id,
+        conta_id: corpo.conta_id,
+        categoria_codigo: corpo.categoria_codigo.trim(),
+        tipo: corpo.tipo,
+        valor: Math.round(valor * 100) / 100,
+        data: corpo.data_lancamento,
+        descricao: corpo.descricao.trim(),
+      })
+      .select("id")
+      .single();
+
+    if (error) {
+      console.error(error);
+      return res.status(500).json({ erro: error.message });
+    }
+
+    res.status(201).json({ criado: true, lancamento_id: criado.id });
+  } catch (falha) {
+    console.error(falha);
+    res.status(500).json({ erro: falha.message || "erro_interno" });
+  }
 });
 
 // JSON malformado no corpo: responde em JSON em vez da pagina HTML padrao
@@ -75,6 +145,6 @@ app.use((err, req, res, next) => {
   res.status(500).json({ erro: "erro_interno" });
 });
 
-app.listen(3000, () => {
-  console.log("financas-familia ouvindo na porta 3000");
+app.listen(PORT, () => {
+  console.log(`financas-familia ouvindo na porta ${PORT}`);
 });
