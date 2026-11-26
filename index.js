@@ -111,12 +111,52 @@ app.post("/lancamentos", async (req, res) => {
       return res.status(500).json({ erro: erroSessao.message });
     }
 
+    // Mesmas verificacoes do app: a conta e a categoria precisam ser de quem
+    // esta logado, e o tipo do lancamento precisa ser o tipo da categoria.
+    const categoriaCodigo = corpo.categoria_codigo.trim();
+    const [conta, categoria] = await Promise.all([
+      supabase
+        .from("contas")
+        .select("id")
+        .eq("id", corpo.conta_id)
+        .eq("user_id", sessao.user.id)
+        .maybeSingle(),
+      supabase
+        .from("categorias")
+        .select("tipo")
+        .eq("codigo", categoriaCodigo)
+        .eq("user_id", sessao.user.id)
+        .maybeSingle(),
+    ]);
+
+    if (conta.error || categoria.error) {
+      const erroConsulta = conta.error || categoria.error;
+      console.error(erroConsulta);
+      return res.status(500).json({ erro: erroConsulta.message });
+    }
+
+    const camposDoDono = [];
+    if (!conta.data) camposDoDono.push("conta_id");
+    if (!categoria.data) camposDoDono.push("categoria_codigo");
+    if (camposDoDono.length > 0) {
+      return res
+        .status(400)
+        .json({ erro: "campos_invalidos", campos: camposDoDono });
+    }
+
+    if (categoria.data.tipo !== corpo.tipo) {
+      return res.status(400).json({
+        erro: "tipo_diferente_da_categoria",
+        tipo_da_categoria: categoria.data.tipo,
+      });
+    }
+
     const { data: criado, error } = await supabase
       .from("lancamentos")
       .insert({
         user_id: sessao.user.id,
         conta_id: corpo.conta_id,
-        categoria_codigo: corpo.categoria_codigo.trim(),
+        categoria_codigo: categoriaCodigo,
         tipo: corpo.tipo,
         valor: Math.round(valor * 100) / 100,
         data: corpo.data_lancamento,

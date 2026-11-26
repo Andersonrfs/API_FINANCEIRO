@@ -68,7 +68,16 @@ O lançamento entra com `situacao = 'confirmado'`, o padrão da tabela.
 | Gravado | **201** `{ "criado": true, "lancamento_id": 4242 }`, com o `id` gerado pelo banco |
 | Sem o cabeçalho `Authorization: Bearer`, ou token inválido ou vencido | **401** `{ "erro": "nao_autenticado" }` |
 | Um ou mais campos errados | **400** `{ "erro": "campos_invalidos", "campos": [...] }`, listando todos, na ordem da tabela acima |
+| Conta ou categoria inexistente ou de outra pessoa | **400** `{ "erro": "campos_invalidos", "campos": ["conta_id", "categoria_codigo"] }`, só com os que falharam |
+| `tipo` diferente do tipo da categoria | **400** `{ "erro": "tipo_diferente_da_categoria", "tipo_da_categoria": "entrada" }` |
 | Corpo que não é JSON válido | **400** `{ "erro": "json_invalido" }` |
 | O Supabase devolveu erro ou não respondeu | **500** `{ "erro": "<mensagem do Supabase>" }`. Nada foi gravado. |
 
-A conta ou a categoria de outra pessoa (ou inexistente) é recusada pelo banco, e a API devolve **500** com a mensagem do Supabase.
+### Ordem das verificações
+
+1. Token presente (senão 401).
+2. Formato dos campos (400 `campos_invalidos`).
+3. Token válido no Supabase (senão 401).
+4. Conta e categoria do dono do token (400 `campos_invalidos`). São as mesmas regras do app Next.js.
+5. Tipo do lançamento igual ao tipo da categoria (400 `tipo_diferente_da_categoria`).
+6. Insert.
